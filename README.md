@@ -1,4 +1,4 @@
-# NETDATA
+# NAGIOS
 
 ## Description
 
