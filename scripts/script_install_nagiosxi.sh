@@ -210,19 +210,108 @@ else
 fi
 
 # =============================================================================
-# 7. POST-INSTALL SUMMARY
+# 7. PORT RECONFIGURATION — HTTP: 8080 / HTTPS: 8443
 # =============================================================================
-
+#
+# Nagios XI installs Apache configs in:
+#   /etc/apache2/ports.conf              — global Listen directives
+#   /etc/apache2/sites-enabled/nagiosxi* — VirtualHost blocks (may vary by distro/version)
+#   /etc/apache2/sites-available/        — same files before symlinking
+#
+# xi-sys.cfg stores the base URL used internally by Nagios XI (e.g. for
+# notification links). We patch that too so self-referential URLs are correct.
+# =============================================================================
+ 
+HTTP_PORT=8080
+HTTPS_PORT=8443
+ 
+log_info "Reconfiguring Apache to listen on HTTP:${HTTP_PORT} / HTTPS:${HTTPS_PORT}..."
+ 
+# --- 7a. ports.conf ---
+PORTS_CONF="/etc/apache2/ports.conf"
+if [[ -f "$PORTS_CONF" ]]; then
+    cp "${PORTS_CONF}" "${PORTS_CONF}.bak_preNagios"
+    # Replace "Listen 80" with new port (word-boundary aware, ignores e.g. "Listen 8080" if already set)
+    sed -i "s/^\(Listen\) 80$/\1 ${HTTP_PORT}/" "$PORTS_CONF"
+    sed -i "s/^\(Listen\) 443$/\1 ${HTTPS_PORT}/" "$PORTS_CONF"
+    # Also handle IfModule ssl_module / http2_module blocks
+    sed -i "/<IfModule ssl_module>/,/<\/IfModule>/ s/^\(\s*Listen\) 443\b/\1 ${HTTPS_PORT}/" "$PORTS_CONF"
+    sed -i "/<IfModule mod_gnutls.c>/,/<\/IfModule>/ s/^\(\s*Listen\) 443\b/\1 ${HTTPS_PORT}/" "$PORTS_CONF"
+    log_ok "ports.conf updated."
+else
+    log_warn "ports.conf not found at $PORTS_CONF — skipping."
+fi
+ 
+# --- 7b. VirtualHost blocks in all Apache site configs ---
+log_info "Patching VirtualHost port declarations in Apache site configs..."
+APACHE_SITES_DIR="/etc/apache2/sites-available"
+if [[ -d "$APACHE_SITES_DIR" ]]; then
+    for conf_file in "$APACHE_SITES_DIR"/*.conf; do
+        [[ -f "$conf_file" ]] || continue
+        cp "${conf_file}" "${conf_file}.bak_preNagios" 2>/dev/null || true
+        # Replace <VirtualHost *:80> and <VirtualHost _default_:80>
+        sed -i "s|<VirtualHost \(.*\):80>|<VirtualHost \1:${HTTP_PORT}>|g" "$conf_file"
+        # Replace <VirtualHost *:443> and variants
+        sed -i "s|<VirtualHost \(.*\):443>|<VirtualHost \1:${HTTPS_PORT}>|g" "$conf_file"
+        log_debug "Patched: $conf_file"
+    done
+    log_ok "VirtualHost ports updated in $APACHE_SITES_DIR."
+else
+    log_warn "Apache sites-available directory not found — skipping VirtualHost patch."
+fi
+ 
+# --- 7c. Nagios XI internal base URL (xi-sys.cfg) ---
+XI_CFG="/usr/local/nagiosxi/etc/xi-sys.cfg"
+if [[ -f "$XI_CFG" ]]; then
+    cp "${XI_CFG}" "${XI_CFG}.bak_prePortChange"
+    # xi-sys.cfg contains a line like: sysprotocol=http or baseurl=http://hostname/nagiosxi
+    # Patch any explicit port-80 or port-443 references in baseurl, and add port to bare http/https URLs
+    sed -i "s|http://\([^/:]*\)/nagiosxi|http://\1:${HTTP_PORT}/nagiosxi|g" "$XI_CFG"
+    sed -i "s|https://\([^/:]*\)/nagiosxi|https://\1:${HTTPS_PORT}/nagiosxi|g" "$XI_CFG"
+    log_ok "xi-sys.cfg base URL updated."
+else
+    log_warn "xi-sys.cfg not found at $XI_CFG — skipping internal URL patch."
+fi
+ 
+# --- 7d. Restart Apache to apply changes ---
+log_info "Restarting Apache..."
+systemctl restart apache2 >> "$LOG_FILE" 2>&1 \
+    || log_error "Apache failed to restart after port change. Check: journalctl -u apache2 --no-pager -n 50"
+log_ok "Apache restarted successfully."
+ 
+# --- 7e. Quick sanity check — confirm Apache is actually listening on new ports ---
+log_info "Verifying Apache is listening on ports ${HTTP_PORT} and ${HTTPS_PORT}..."
+sleep 2  # brief settle time
+HTTP_LISTEN=$(ss -tlnp | grep ":${HTTP_PORT} " || true)
+HTTPS_LISTEN=$(ss -tlnp | grep ":${HTTPS_PORT} " || true)
+ 
+if [[ -n "$HTTP_LISTEN" ]]; then
+    log_ok "Apache confirmed listening on HTTP:${HTTP_PORT}."
+else
+    log_warn "Apache does not appear to be listening on port ${HTTP_PORT}. Check: ss -tlnp | grep apache"
+fi
+ 
+if [[ -n "$HTTPS_LISTEN" ]]; then
+    log_ok "Apache confirmed listening on HTTPS:${HTTPS_PORT}."
+else
+    log_warn "Apache does not appear to be listening on port ${HTTPS_PORT} (expected if SSL not yet configured)."
+fi
+ 
+# =============================================================================
+# 8. POST-INSTALL SUMMARY
+# =============================================================================
+ 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 PASSWORDS_FILE="/usr/local/nagiosxi/etc/xi-sys.cfg"
-
+ 
 echo ""
 echo "============================================================"
 echo "  Nagios XI installation successful!"
 echo "============================================================"
-echo "  Web UI    : http://${SERVER_IP}/nagiosxi"
-echo "  Passwords : $PASSWORDS_FILE"
-echo "  Full log  : $LOG_FILE"
+echo "  Web UI (HTTP) : http://${SERVER_IP}:${HTTP_PORT}/nagiosxi"
+echo "  Web UI (HTTPS): https://${SERVER_IP}:${HTTPS_PORT}/nagiosxi"
+echo "  Passwords     : $PASSWORDS_FILE"
+echo "  Full log      : $LOG_FILE"
 echo "------------------------------------------------------------"
 echo "  MySQL disk layout:"
 echo "    Disk      : $MYSQL_DISK"
@@ -230,11 +319,20 @@ echo "    Partition : $MYSQL_PART  (UUID: $PART_UUID)"
 echo "    Mount     : $MYSQL_DIR"
 echo "    fstab     : persistent (noatime, fsck order 2)"
 echo "------------------------------------------------------------"
+echo "  Apache port changes:"
+echo "    HTTP  : 80  → ${HTTP_PORT}"
+echo "    HTTPS : 443 → ${HTTPS_PORT}"
+echo "    Backups of modified configs saved as *.bak_preNagios / *.bak_prePortChange"
+echo "------------------------------------------------------------"
 echo "  Next steps:"
-echo "    1. Open http://${SERVER_IP}/nagiosxi in your browser"
+echo "    1. Open http://${SERVER_IP}:${HTTP_PORT}/nagiosxi in your browser"
 echo "    2. Set timezone, language, and theme"
 echo "    3. Set the admin password"
 echo "    4. Enter your license key or select Trial"
 echo "    5. Click 'Finish Install'"
+echo "    NOTE: If a firewall is active, open ports ${HTTP_PORT} and ${HTTPS_PORT}:"
+echo "      ufw allow ${HTTP_PORT}/tcp && ufw allow ${HTTPS_PORT}/tcp"
 echo "============================================================"
 echo ""
+ 
+
